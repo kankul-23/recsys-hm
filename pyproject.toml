@@ -1,0 +1,55 @@
+[project]
+name = "recsys-hm"
+version = "0.1.0"
+description = "Two-stage personalized recommender system (Retrieval -> Reranking) on H&M dataset"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+
+dependencies = [
+    # --- Data engine ---
+    "polars>=0.20,<1.0",
+    "pyarrow>=14.0",          # parquet backend for polars
+
+    # --- Candidate generation (Stage 1) ---
+    "implicit>=0.7.2",
+    "scipy>=1.11",
+
+    # --- Reranking (Stage 2) ---
+    "catboost>=1.2",
+
+    # --- Config / validation ---
+    "pydantic>=2.5",
+    "pyyaml>=6.0",
+
+    # --- Serving ---
+    "fastapi>=0.109",
+    "uvicorn[standard]>=0.27",
+
+    # --- Notebooks / EDA ---
+    "jupyter>=1.0",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+
+    # --- Metrics / utils ---
+    "numpy>=1.26,<2.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.26",           # required by FastAPI TestClient
+    "ruff>=0.2",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "service*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

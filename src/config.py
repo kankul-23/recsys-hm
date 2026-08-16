@@ -29,6 +29,10 @@ class TemporalSplit(BaseModel):
     test_end: Optional[str] = None
 
 
+class AnomalyFilterConfig(BaseModel):
+    max_transactions: int
+
+
 class ALSConfig(BaseModel):
     factors: int
     iterations: int
@@ -62,6 +66,7 @@ class ServiceConfig(BaseModel):
 class Config(BaseModel):
     paths: Paths
     temporal_split: TemporalSplit
+    anomaly_filter: AnomalyFilterConfig
     als: ALSConfig
     negative_sampling: NegativeSamplingConfig
     ranker: RankerConfig

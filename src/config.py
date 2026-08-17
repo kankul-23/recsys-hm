@@ -39,6 +39,7 @@ class ALSConfig(BaseModel):
     regularization: float
     top_k_candidates: int
     random_state: int
+    confidence_alpha: int
 
 
 class NegativeSamplingConfig(BaseModel):

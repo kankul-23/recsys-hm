@@ -23,3 +23,6 @@ venv/
 
 # Env
 .env
+
+# CatBoost
+catboost_info/

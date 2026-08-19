@@ -249,6 +249,13 @@ class ALSCandidateGenerator:
         self._article_idx_to_article_id = dict(
             zip(item_mapping["article_idx"].to_list(), item_mapping["article_id"].to_list())
         )
+        # Обратный словарь article_id -> article_idx — нужен score_pairs()
+        # для перевода произвольных пар (customer_idx, article_id) во
+        # внутренние индексы матрицы, в дополнение к уже существующему
+        # article_idx -> article_id, который используют recommend_*.
+        self._article_id_to_article_idx = dict(
+            zip(item_mapping["article_id"].to_list(), item_mapping["article_idx"].to_list())
+        )
 
     def recommend_for_users(self, customer_idxs: list[int]) -> dict[int, list[int]]:
         """
@@ -293,6 +300,114 @@ class ALSCandidateGenerator:
             recommendations[customer_idx] = article_ids
 
         return recommendations
+
+    def recommend_with_scores_for_users(
+        self, customer_idxs: list[int]
+    ) -> dict[int, list[tuple[int, float]]]:
+        """
+        То же самое, что recommend_for_users(), но дополнительно возвращает
+        сырой als_score для каждого кандидата — нужно для Фазы 7 (Feature
+        Engineering), где als_score используется как один из признаков пары
+        (User, Candidate_Item) для CatBoost.
+
+        Не заменяет recommend_for_users(): тот метод используется в оценке
+        (run_als_eval.py, tune_als_alpha.py), где скор не нужен — там
+        предсказания сравниваются с ground truth только по факту попадания
+        article_id в top-K. Разделение методов сохраняет старый контракт
+        нетронутым и не расширяет его опциональным флагом, который усложнил
+        бы сигнатуру ради одного нового потребителя (builder.py).
+
+        Логика идентична recommend_for_users() (тот же фильтр холодных
+        юзеров, тот же filter_already_liked_items=True) — только на выходе
+        список пар (article_id, als_score) вместо голых article_id.
+        """
+        known_customer_idxs = [c for c in customer_idxs if c in self._customer_idx_to_matrix_idx]
+        skipped = len(customer_idxs) - len(known_customer_idxs)
+        if skipped:
+            logger.info(
+                "%d юзеров из %d не встречались в train — пропущены (холодный старт, fallback на Popularity)",
+                skipped, len(customer_idxs),
+            )
+
+        matrix_user_idxs = np.array(
+            [self._customer_idx_to_matrix_idx[c] for c in known_customer_idxs]
+        )
+
+        item_idxs, scores = self.model.recommend(
+            matrix_user_idxs,
+            self.interaction_matrix[matrix_user_idxs],
+            N=self.top_k,
+            filter_already_liked_items=True,
+        )
+
+        recommendations: dict[int, list[tuple[int, float]]] = {}
+        for customer_idx, row_item_idxs, row_scores in zip(known_customer_idxs, item_idxs, scores):
+            article_scores = [
+                (self._article_idx_to_article_id[idx], float(score))
+                for idx, score in zip(row_item_idxs, row_scores)
+                if idx in self._article_idx_to_article_id  # implicit паддинг: -1 при нехватке кандидатов
+            ]
+            recommendations[customer_idx] = article_scores
+
+        return recommendations
+
+    def score_pairs(self, customer_idxs: list[int], article_ids: list[int]) -> list[float | None]:
+        """
+        Считает "сырой" ALS-скор (dot-product user_factors x item_factors)
+        для ПРОИЗВОЛЬНОГО списка пар (customer_idx, article_id) — включая
+        пары, где article_id уже куплен этим юзером в train.
+
+        Отличие от recommend_with_scores_for_users(): тот метод — top-K
+        РЕКОМЕНДАЦИЙ модели с обязательным filter_already_liked_items=True,
+        то есть купленные товары туда принципиально попасть не могут.
+        Этот метод — скор для КОНКРЕТНОЙ заданной пары, без какой-либо
+        фильтрации, тем же способом, каким сам ALS ранжирует кандидатов
+        внутри model.recommend() (dot-product факторов).
+
+        Нужен для Фазы 7 (builder.py): позитивные пары (реальные покупки)
+        обязаны получить содержательный als_score, а не null. Если считать
+        als_score только через recommend_with_scores_for_users (top-K с
+        фильтром), для ВСЕХ позитивов als_score будет null по построению —
+        товар, который юзер купил, туда не попадёт никогда, поскольку
+        именно он и исключается фильтром. Модель тогда обучается отличать
+        null/not-null als_score вместо реального сигнала — обнаружено
+        smoke-тестом ranker'а (Фаза 8): als_score получал importance=0.65
+        при том, что null в нём идеально совпадал с label=1.
+
+        Векторизовано через поэлементное произведение + сумму по оси
+        факторов (эквивалент батча dot-product), а не Python-цикл с
+        np.dot на пару — на позитивах train (~25.7M строк) построчный
+        Python-цикл был бы на порядки медленнее и стал бы новым узким
+        местом сборки признаков.
+
+        Возвращает None для пар, где customer_idx или article_id не
+        встречались в train (холодный юзер/товар — ALS не строил для них
+        вектор, скор физически не из чего посчитать).
+        """
+        item_idxs = np.array(
+            [self._article_id_to_article_idx.get(a, -1) for a in article_ids]
+        )
+        matrix_idxs = np.array(
+            [self._customer_idx_to_matrix_idx.get(c, -1) for c in customer_idxs]
+        )
+
+        valid_mask = (item_idxs >= 0) & (matrix_idxs >= 0)
+
+        # -1 как временная заглушка для невалидных индексов, чтобы не
+        # выйти за границы factors при батчевой индексации; реальные
+        # значения для этих позиций всё равно отбрасываются valid_mask
+        # ниже и заменяются на None.
+        safe_matrix_idxs = np.where(valid_mask, matrix_idxs, 0)
+        safe_item_idxs = np.where(valid_mask, item_idxs, 0)
+
+        user_vecs = self.model.user_factors[safe_matrix_idxs]
+        item_vecs = self.model.item_factors[safe_item_idxs]
+        raw_scores = np.sum(user_vecs * item_vecs, axis=1)
+
+        return [
+            float(score) if is_valid else None
+            for score, is_valid in zip(raw_scores, valid_mask)
+        ]
 
 
 # =============================================================================
